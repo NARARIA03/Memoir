@@ -23,6 +23,8 @@
     "eslint": "^9",
     "eslint-config-next": "16.1.4",
     "husky": "^9.1.7",
+    "lint-staged": "^16.2.7",
+    "prettier": "3.8.1",
     "tailwindcss": "^4",
     "typescript": "^5"
   }
