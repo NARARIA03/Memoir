@@ -42,4 +42,4 @@ Memoir는 기록에 들어가는 공수를 최소화하고, RAG를 통해 언제
 
 ## Architecture
 
-![alt text](image-1.png)
+![alt text](architecture.png)
