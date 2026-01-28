@@ -18,19 +18,21 @@ Memoir는 파편화된 업무 기록(Notion, GitHub Issue 등)을 AI를 통해 *
 | 영역       | 기술                                                         |
 | ---------- | ------------------------------------------------------------ |
 | Frontend   | Next.js 16 (App Router), React 19, Tailwind CSS 4, shadcn/ui |
-| Backend    | Next.js Route Handlers                                       |
+| Backend    | RSC + Server Actions (Route Handler 최소화)                  |
 | Database   | PostgreSQL + pgvector                                        |
 | ORM        | Prisma                                                       |
-| Data Fetch | TanStack Query v5 (React Query)                              |
+| Data Fetch | RSC에서 Prisma 직접 호출 + revalidatePath                    |
+| AI SDK     | Vercel AI SDK                                                |
 | Validation | Zod                                                          |
-| LLM        | Claude Sonnet 4 / GPT-5 (미정, 교체 가능하게 설계)           |
+| LLM        | OpenAI GPT 시리즈 (Vercel AI SDK로 추상화)                   |
 | Embedding  | OpenAI text-embedding-3-small                                |
 | Infra      | Docker Compose, Cloudflare Tunnel, GitHub Actions CI/CD      |
 | Language   | TypeScript 5 (strict mode)                                   |
 
 ### 주요 라이브러리
 
-- **TanStack Query v5**: 서버 상태 관리, prefetch 기반 SSR
+- **Vercel AI SDK**: LLM 호출 추상화, 스트리밍 응답, 구조화된 출력(Structured Output), Server
+  Actions 네이티브 통합
 - **Prisma**: 타입 안전한 DB 접근, pgvector 지원
 - **Zod**: 런타임 스키마 검증 + LLM 응답 파싱
 - **shadcn/ui**: 빠른 UI 구축
@@ -39,10 +41,52 @@ Memoir는 파편화된 업무 기록(Notion, GitHub Issue 등)을 AI를 통해 *
 
 ### 배포 구조
 
-```
-User → Cloudflare Network → cloudflared (Tunnel) → Docker Compose
-                                                      ├── Next.js (Frontend + API)
-                                                      └── PostgreSQL + pgvector
+```mermaid
+---
+config:
+  layout: elk
+---
+flowchart LR
+    subgraph Next["Next.js"]
+        AR["App Router"]
+        RSC["Server Component"]
+        SA["Server Actions"]
+        RH["Route Handler"]
+        AISDK["Vercel AI SDK"]
+    end
+    subgraph Docker["Docker Compose"]
+        Next
+        DB[("PostgreSQL + pgvector")]
+    end
+    subgraph Server["Home Server"]
+        CT["cloudflared"]
+        Docker
+    end
+
+    User(("User")) -->|HTTPS| CF["Cloudflare Network"]
+    CF -.->|Tunnel| CT
+    CT --> AR
+    AR --> RSC & SA & RH
+
+    RSC -->|Prisma Query| DB
+    SA -->|Prisma Mutation| DB
+    RH -->|Vector Search| DB
+
+    SA -.->|revalidatePath| RSC
+    SA -->|Structured Output & Embedding| AISDK
+    RH -->|Streaming| AISDK
+    AISDK -.->|API Call| OpenAI["OpenAI API"]
+
+    style AR fill:#000,stroke:#333,color:#fff
+    style RSC fill:#111,stroke:#333,color:#fff
+    style SA fill:#222,stroke:#333,color:#fff
+    style RH fill:#222,stroke:#333,color:#fff
+    style AISDK fill:#333,stroke:#333,color:#fff
+    style DB fill:#336791,stroke:#333,color:#fff
+    style CT fill:#059,stroke:#333,color:#fff
+    style User fill:#666,stroke:#333,color:#fff
+    style CF fill:#f60,stroke:#333,color:#fff
+    style OpenAI fill:#10a37f,stroke:#333,color:#fff
 ```
 
 - 홈서버에서 Docker Compose로 운영
@@ -54,162 +98,182 @@ User → Cloudflare Network → cloudflared (Tunnel) → Docker Compose
 ```
 [페이지 1: Input]
 원본 텍스트 붙여넣기
-    ↓ useMutation → POST /api/records/process
+    ↓ Server Action: processRecordAction()
     ↓ LLM 호출 (구조화 + 민감정보 추출)
     ↓ Draft 상태로 DB 저장
-    ↓ router.push → /review/[id]
+    ↓ redirect → /review/[id]
 
 [페이지 2: Review]
 폼에서 검토/수정 (민감정보 하이라이트)
-    ↓ useMutation → POST /api/records/confirm
+    ↓ Server Action: confirmRecordAction()
     ↓ Embedding 생성
     ↓ pgvector + RDB 저장 (Confirmed 상태)
-    ↓ invalidateQueries → /records
+    ↓ revalidatePath + redirect → /records
 
 [페이지 3: Chat]
 RAG 채팅 (stateless, 매번 새 대화)
-    ↓ POST /api/chat (streaming)
-    ↓ Query embedding → pgvector 유사도 검색 → LLM 응답
+    ↓ useChat hook → Route Handler: POST /api/chat
+    ↓ Query embedding → pgvector 유사도 검색 → LLM 스트리밍 응답
 
 [페이지 4: Records]
 업무 기록 테이블 뷰 (노션 스타일)
-    ↓ prefetchQuery + useQuery
+    ↓ RSC에서 Prisma 직접 호출
 ```
 
-### 데이터 Fetching 전략 (React Query v5 + Prefetch)
+### 데이터 Fetching 전략 (RSC + Server Actions)
 
-서버 컴포넌트에서 prefetch하고, 클라이언트 컴포넌트에서 useQuery로 hydrate하는 패턴.
+RSC에서 Prisma를 직접 호출하고, 데이터 변경은 Server Actions로 처리. fetch 호출 없이 타입 안전한
+데이터 흐름 유지.
 
-| 작업      | 방식                            |
-| --------- | ------------------------------- |
-| 조회      | prefetchQuery (SSR) + useQuery  |
-| 생성/수정 | useMutation + invalidateQueries |
-| 삭제      | useMutation + invalidateQueries |
-| 스트리밍  | Route Handler (채팅 등)         |
+| 작업          | 방식                               |
+| ------------- | ---------------------------------- |
+| 조회          | RSC에서 Prisma 직접 호출           |
+| 생성/수정     | Server Action + revalidatePath     |
+| 삭제          | Server Action + revalidatePath     |
+| Chat 스트리밍 | Route Handler + useChat (ai/react) |
 
-#### Prefetch 패턴 예시
+#### RSC 데이터 조회 패턴
 
 ```typescript
 // app/records/page.tsx (서버 컴포넌트)
-import { dehydrate, HydrationBoundary, QueryClient } from '@tanstack/react-query';
-import { getRecords } from '@/features/record/apis';
-import RecordsContainer from '@/features/record/containers/RecordsContainer';
+import { prisma } from '@/lib/prisma';
+import RecordTable from '@/features/record/components/RecordTable';
 
 const RecordsPage = async () => {
-  const queryClient = new QueryClient();
-
-  await queryClient.prefetchQuery({
-    queryKey: ['records'],
-    queryFn: getRecords,
+  const records = await prisma.workRecord.findMany({
+    where: { status: 'CONFIRMED' },
+    orderBy: { createdAt: 'desc' },
   });
 
-  return (
-    <HydrationBoundary state={dehydrate(queryClient)}>
-      <RecordsContainer />
-    </HydrationBoundary>
-  );
+  return <RecordTable records={records} />;
 };
 
 export default RecordsPage;
 ```
 
-```typescript
-// features/record/containers/RecordsContainer.tsx
-'use client';
-
-import { useRecords } from '../hooks/queries/useRecords';
-
-const RecordsContainer = () => {
-  const { data: records } = useRecords();
-
-  return <RecordTable records={records} />;
-};
-
-export default RecordsContainer;
-```
+#### Server Action 패턴
 
 ```typescript
-// features/record/hooks/queries/useRecords.ts
-import { useQuery } from '@tanstack/react-query';
-import { getRecords } from '../../apis';
+// features/record/actions/confirmRecordAction.ts
+'use server';
 
-export const useRecords = () => {
-  return useQuery({
-    queryKey: ['records'],
-    queryFn: getRecords,
-  });
-};
-```
+import { revalidatePath } from 'next/cache';
+import { redirect } from 'next/navigation';
+import { prisma } from '@/lib/prisma';
+import { generateEmbedding } from '@/lib/embedding';
 
-#### Mutation 패턴 예시
+export const confirmRecordAction = async (formData: FormData) => {
+  const id = formData.get('id') as string;
+  const company = formData.get('company') as string;
+  // ... 폼 데이터 추출
 
-```typescript
-// features/record/hooks/mutations/useConfirmRecord.ts
-import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { useRouter } from 'next/navigation';
-import { confirmRecord } from '../../apis';
+  // Embedding 생성
+  const embedding = await generateEmbedding(`${company} ${project} ${summary}`);
 
-export const useConfirmRecord = () => {
-  const queryClient = useQueryClient();
-  const router = useRouter();
-
-  return useMutation({
-    mutationFn: confirmRecord,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['records'] });
-      router.push('/records');
+  // DB 저장
+  await prisma.workRecord.update({
+    where: { id },
+    data: {
+      company,
+      project,
+      // ... 나머지 필드
+      status: 'CONFIRMED',
     },
   });
+
+  // 벡터 저장 (raw query)
+  await prisma.$executeRaw`
+    UPDATE "WorkRecord"
+    SET embedding = ${embedding}::vector
+    WHERE id = ${id}
+  `;
+
+  revalidatePath('/records');
+  redirect('/records');
 };
+```
+
+#### Chat 스트리밍 (Route Handler + useChat)
+
+Chat 기능은 `ai/rsc`가 실험적 상태이므로, 안정적인 `ai/react` + Route Handler 조합을 사용한다.
+
+```typescript
+// app/api/chat/route.ts
+import { streamText } from 'ai';
+import { openai } from '@ai-sdk/openai';
+import { generateEmbedding, searchSimilarRecords } from '@/lib/embedding';
+
+export const POST = async (req: Request) => {
+  const { messages } = await req.json();
+  const lastMessage = messages[messages.length - 1].content;
+
+  // RAG: 유사 기록 검색
+  const queryEmbedding = await generateEmbedding(lastMessage);
+  const context = await searchSimilarRecords(queryEmbedding);
+
+  const result = streamText({
+    model: openai('gpt-4o'),
+    system: `당신은 사용자의 커리어 코치입니다. 다음 맥락을 참고하세요:\n${JSON.stringify(context)}`,
+    messages,
+  });
+
+  return result.toDataStreamResponse();
+};
+```
+
+```typescript
+// features/chat/components/ChatInterface.tsx
+'use client';
+
+import { useChat } from 'ai/react';
+
+const ChatInterface = () => {
+  const { messages, input, handleInputChange, handleSubmit } = useChat();
+
+  return (
+    <div>
+      {messages.map((m) => (
+        <div key={m.id}>{m.role}: {m.content}</div>
+      ))}
+      <form onSubmit={handleSubmit}>
+        <input value={input} onChange={handleInputChange} />
+      </form>
+    </div>
+  );
+};
+
+export default ChatInterface;
 ```
 
 ## 폴더 구조
 
 ```
 src/
-├── app/                          # Next.js App Router (라우팅 전용, thin layer)
+├── app/                          # Next.js App Router
 │   ├── input/
-│   │   └── page.tsx              # → <InputContainer />
+│   │   └── page.tsx              # 원본 텍스트 입력 페이지
 │   ├── review/
 │   │   └── [id]/
-│   │       └── page.tsx          # → <ReviewContainer />
+│   │       └── page.tsx          # 검토/수정 페이지
 │   ├── chat/
-│   │   └── page.tsx              # → <ChatContainer />
+│   │   └── page.tsx              # RAG 채팅 페이지
 │   ├── records/
-│   │   └── page.tsx              # → prefetch + <RecordsContainer />
-│   ├── api/                      # Route Handlers
-│   │   ├── records/
-│   │   │   ├── route.ts          # GET (목록), POST (생성)
-│   │   │   ├── [id]/
-│   │   │   │   └── route.ts      # GET, PATCH, DELETE
-│   │   │   ├── process/
-│   │   │   │   └── route.ts      # POST: 원본 → LLM 구조화
-│   │   │   └── confirm/
-│   │   │       └── route.ts      # POST: 최종 저장 + 벡터화
+│   │   └── page.tsx              # 업무 기록 목록 (RSC에서 Prisma 직접 호출)
+│   ├── api/                      # Route Handlers (최소화)
 │   │   └── chat/
-│   │       └── route.ts          # POST: RAG 채팅 (streaming)
+│   │       └── route.ts          # RAG 채팅 스트리밍 (useChat 연동)
 │   ├── layout.tsx
 │   ├── page.tsx                  # 랜딩 또는 /input 리다이렉트
-│   ├── providers.tsx             # QueryClientProvider 등
 │   └── globals.css
 │
 ├── features/                     # 도메인별 로직 (FSD 스타일)
 │   ├── record/                   # 업무 기록 도메인
-│   │   ├── apis/                 # API 호출 함수
-│   │   │   ├── getRecords.ts
-│   │   │   ├── getRecord.ts
-│   │   │   ├── processRecord.ts
-│   │   │   ├── confirmRecord.ts
+│   │   ├── actions/              # Server Actions
+│   │   │   ├── processRecordAction.ts  # 원본 → LLM 구조화
+│   │   │   ├── confirmRecordAction.ts  # 최종 저장 + 벡터화
+│   │   │   ├── deleteRecordAction.ts   # 기록 삭제
 │   │   │   └── index.ts
 │   │   ├── components/           # UI 컴포넌트
-│   │   ├── containers/           # 페이지 컨테이너
-│   │   ├── hooks/
-│   │   │   ├── queries/          # useQuery 훅
-│   │   │   │   ├── useRecords.ts
-│   │   │   │   └── useRecord.ts
-│   │   │   └── mutations/        # useMutation 훅
-│   │   │       ├── useProcessRecord.ts
-│   │   │       └── useConfirmRecord.ts
 │   │   ├── services/             # 비즈니스 로직 (서버 사이드)
 │   │   │   └── structureRecord.ts
 │   │   ├── prompts/              # LLM 프롬프트 템플릿
@@ -217,10 +281,7 @@ src/
 │   │   ├── types/
 │   │   └── utils/
 │   └── chat/                     # RAG 채팅 도메인
-│       ├── apis/
-│       ├── components/
-│       ├── containers/
-│       ├── hooks/
+│       ├── components/           # ChatInterface 등
 │       ├── prompts/
 │       └── services/
 │
@@ -229,9 +290,8 @@ src/
 │
 ├── lib/                          # 인프라 레벨 유틸리티
 │   ├── prisma.ts                 # Prisma 클라이언트 싱글톤
-│   ├── llm.ts                    # LLM API 호출 추상화 (Claude/GPT 스위칭)
-│   ├── embedding.ts              # OpenAI Embedding 클라이언트
-│   ├── queryClient.ts            # QueryClient 팩토리
+│   ├── ai.ts                     # Vercel AI SDK 설정 (모델 인스턴스)
+│   ├── embedding.ts              # OpenAI Embedding + pgvector 검색
 │   └── utils.ts                  # cn() 등 유틸
 │
 ├── types/                        # 전역 타입 정의
@@ -243,10 +303,11 @@ src/
 
 ### 폴더 구조 원칙
 
-- **app/**: 라우팅만 담당, 비즈니스 로직 없음. page.tsx는 prefetch + container 렌더링
+- **app/**: 라우팅 + RSC 데이터 조회. page.tsx에서 Prisma 직접 호출 가능
 - **features/**: 도메인별 로직 캡슐화. feature 간 참조 금지
+- **features/\*/actions/**: Server Actions 정의. 데이터 변경 로직 담당
 - **components/**: 순수 UI 컴포넌트, 비즈니스 로직 없음
-- **lib/**: DB, 외부 API 등 인프라 레벨 코드. 모든 feature에서 참조 가능
+- **lib/**: DB, AI SDK 등 인프라 레벨 코드. 모든 feature에서 참조 가능
 
 ### 의존성 방향
 
@@ -260,107 +321,16 @@ app → features → lib
 - features끼리는 서로 참조하지 않음
 - 공통 로직은 lib으로 추출
 
-## React Query 설정
-
-### QueryClient Provider
-
-```typescript
-// app/providers.tsx
-'use client';
-
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { ReactQueryDevtools } from '@tanstack/react-query-devtools';
-import { useState } from 'react';
-
-type Props = {
-  children: React.ReactNode;
-};
-
-const Providers = ({ children }: Props) => {
-  const [queryClient] = useState(
-    () =>
-      new QueryClient({
-        defaultOptions: {
-          queries: {
-            staleTime: 60 * 1000, // 1분
-          },
-        },
-      })
-  );
-
-  return (
-    <QueryClientProvider client={queryClient}>
-      {children}
-      <ReactQueryDevtools initialIsOpen={false} />
-    </QueryClientProvider>
-  );
-};
-
-export default Providers;
-```
-
-```typescript
-// app/layout.tsx
-import Providers from './providers';
-
-const RootLayout = ({ children }: { children: React.ReactNode }) => {
-  return (
-    <html lang="ko">
-      <body>
-        <Providers>{children}</Providers>
-      </body>
-    </html>
-  );
-};
-
-export default RootLayout;
-```
-
-### Prefetch용 QueryClient 팩토리
-
-```typescript
-// lib/queryClient.ts
-import { QueryClient } from '@tanstack/react-query';
-
-export const createQueryClient = () =>
-  new QueryClient({
-    defaultOptions: {
-      queries: {
-        staleTime: 60 * 1000,
-      },
-    },
-  });
-```
-
 ## 데이터 모델
 
-### Prisma 개요
+### WorkRecord 스키마 (초안)
 
-Prisma는 Node.js/TypeScript용 ORM으로, 다음 구성요소로 이루어짐:
-
-- **Prisma Schema** (`prisma/schema.prisma`): 데이터 모델 정의
-- **Prisma Client**: 타입 안전한 쿼리 빌더 (자동 생성)
-- **Prisma Migrate**: 스키마 변경 → DB 마이그레이션
-- **Prisma Studio**: DB GUI 도구
-
-### Prisma Schema
+구현 과정에서 변경될 수 있음. 핵심 필드만 정의.
 
 ```prisma
-// prisma/schema.prisma
-generator client {
-  provider        = "prisma-client-js"
-  previewFeatures = ["postgresqlExtensions"]
-}
-
-datasource db {
-  provider   = "postgresql"
-  url        = env("DATABASE_URL")
-  extensions = [vector]
-}
-
 model WorkRecord {
   id        String   @id @default(cuid())
-  status    Status   @default(DRAFT)
+  status    Status   @default(DRAFT)   // DRAFT | CONFIRMED
 
   // 메타데이터
   company     String
@@ -371,214 +341,107 @@ model WorkRecord {
   tags        String[]
 
   // 구조화된 콘텐츠
-  summary     String    // 한 줄 요약 (이력서용)
+  summary     String    // 한 줄 요약
   problem     String    // 문제 상황 + 해결 과정
   decision    String    // 의사결정 근거
   reflection  String    // 배운점 / 아쉬운점
 
   // 원본 및 벡터
-  rawContent  String    // 원본 텍스트 (복붙한 그대로)
+  rawContent  String
   embedding   Unsupported("vector(1536)")?
 
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }
-
-enum Status {
-  DRAFT      // LLM 구조화 완료, 사용자 검토 전
-  CONFIRMED  // 사용자 검토 완료, 벡터화 저장됨
-}
-```
-
-### Prisma 클라이언트 설정
-
-```typescript
-// lib/prisma.ts
-import { PrismaClient } from '@prisma/client';
-
-const globalForPrisma = globalThis as unknown as {
-  prisma: PrismaClient | undefined;
-};
-
-export const prisma =
-  globalForPrisma.prisma ??
-  new PrismaClient({
-    log: process.env.NODE_ENV === 'development' ? ['query'] : [],
-  });
-
-if (process.env.NODE_ENV !== 'production') {
-  globalForPrisma.prisma = prisma;
-}
-```
-
-개발 환경에서 Hot Reload 시 여러 Prisma 인스턴스가 생성되는 것을 방지하기 위해 globalThis에
-싱글톤으로 저장한다.
-
-### Prisma 사용 예시
-
-```typescript
-// 조회
-const records = await prisma.workRecord.findMany({
-  where: { status: 'CONFIRMED' },
-  orderBy: { createdAt: 'desc' },
-});
-
-// 단건 조회
-const record = await prisma.workRecord.findUnique({
-  where: { id },
-});
-
-// 생성
-const newRecord = await prisma.workRecord.create({
-  data: {
-    company: 'Acme Corp',
-    project: 'Dashboard',
-    // ...
-  },
-});
-
-// 수정
-const updated = await prisma.workRecord.update({
-  where: { id },
-  data: { status: 'CONFIRMED' },
-});
-
-// 삭제
-await prisma.workRecord.delete({
-  where: { id },
-});
 ```
 
 ### pgvector 유사도 검색
 
-```typescript
-// lib/embedding.ts
-import { prisma } from './prisma';
-
-export const searchSimilarRecords = async (queryEmbedding: number[], limit = 5) => {
-  const results = await prisma.$queryRaw`
-    SELECT id, company, project, summary, problem, decision, reflection,
-           embedding <=> ${queryEmbedding}::vector AS distance
-    FROM "WorkRecord"
-    WHERE status = 'CONFIRMED'
-    ORDER BY distance
-    LIMIT ${limit}
-  `;
-
-  return results;
-};
-```
-
-### LLM 응답 스키마 (구조화 + 민감정보)
+RAG 검색 시 `<=>` 연산자로 코사인 거리 계산.
 
 ```typescript
-// features/record/schemas/structuredRecord.ts
-import { z } from 'zod';
-
-export const structuredRecordSchema = z.object({
-  structured: z.object({
-    company: z.string(),
-    project: z.string(),
-    startAt: z.string(), // ISO date string
-    endAt: z.string().nullable(),
-    techStack: z.array(z.string()),
-    tags: z.array(z.string()),
-    summary: z.string(),
-    problem: z.string(),
-    decision: z.string(),
-    reflection: z.string(),
-  }),
-  sensitiveTerms: z.array(z.string()), // 민감정보 문자열 배열
-});
-
-export type StructuredRecord = z.infer<typeof structuredRecordSchema>;
+const results = await prisma.$queryRaw`
+  SELECT id, summary, problem, decision,
+         embedding <=> ${queryEmbedding}::vector AS distance
+  FROM "WorkRecord"
+  WHERE status = 'CONFIRMED'
+  ORDER BY distance
+  LIMIT ${limit}
+`;
 ```
 
-## API 설계
+## Server Actions 설계
 
-### GET /api/records
+Route Handler 대신 Server Actions를 사용하여 데이터 변경을 처리한다.
 
-업무 기록 목록 조회
-
-```typescript
-// Response
-{
-  records: WorkRecord[]
-}
-```
-
-### GET /api/records/[id]
-
-업무 기록 단건 조회
-
-```typescript
-// Response
-{
-  record: WorkRecord;
-}
-```
-
-### POST /api/records/process
+### processRecordAction
 
 원본 텍스트를 LLM으로 구조화하고 Draft 저장
 
 ```typescript
-// Request
-{
-  rawContent: string
-}
+// features/record/actions/processRecordAction.ts
+'use server';
 
-// Response
-{
-  id: string,
-  structured: { ... },
-  sensitiveTerms: string[]
-}
+type ProcessRecordInput = {
+  rawContent: string;
+};
+
+type ProcessRecordOutput = {
+  id: string;
+  structured: StructuredRecord;
+  sensitiveTerms: string[];
+};
+
+export const processRecordAction = async (
+  input: ProcessRecordInput
+): Promise<ProcessRecordOutput> => {
+  // LLM 호출 → 구조화 + 민감정보 추출
+  // Draft 상태로 DB 저장
+  // redirect('/review/[id]') 또는 id 반환
+};
 ```
 
-### POST /api/records/confirm
+### confirmRecordAction
 
 사용자가 검토/수정한 데이터를 최종 저장 + 벡터화
 
 ```typescript
-// Request
-{
-  id: string,
-  company: string,
-  project: string,
-  // ... 모든 필드
-}
+// features/record/actions/confirmRecordAction.ts
+'use server';
 
-// Response
-{
-  id: string,
-  status: 'CONFIRMED'
-}
+export const confirmRecordAction = async (formData: FormData): Promise<void> => {
+  // 폼 데이터 파싱 + Zod 검증
+  // Embedding 생성
+  // DB 저장 (status: CONFIRMED)
+  // revalidatePath('/records')
+  // redirect('/records')
+};
 ```
 
-### DELETE /api/records/[id]
+### deleteRecordAction
 
 업무 기록 삭제
 
 ```typescript
-// Response
-{
-  success: boolean;
-}
+// features/record/actions/deleteRecordAction.ts
+'use server';
+
+export const deleteRecordAction = async (id: string): Promise<void> => {
+  // DB 삭제
+  // revalidatePath('/records')
+};
 ```
 
-### POST /api/chat
+### 조회는 RSC에서 직접
 
-RAG 채팅 (stateless, streaming)
+목록/단건 조회는 Server Action이 아닌 RSC에서 Prisma를 직접 호출한다.
 
 ```typescript
-// Request
-{
-  message: string;
-}
+// app/records/page.tsx
+const records = await prisma.workRecord.findMany({ ... });
 
-// Response
-ReadableStream<string>;
+// app/review/[id]/page.tsx
+const record = await prisma.workRecord.findUnique({ where: { id } });
 ```
 
 ## 코딩 컨벤션
@@ -589,13 +452,14 @@ ReadableStream<string>;
 - `@typescript-eslint/consistent-type-imports` 사용 (`import type`)
 - 미사용 변수는 `_` prefix로 명시적 표현
 - `interface` 사용 금지, `type`만 사용
+- `React.ReactNode` 등 React 네임스페이스 절대 사용하지 말 것
 
 ### 파일/폴더 네이밍
 
-- 컴포넌트: PascalCase (`InputContainer.tsx`)
-- 훅: camelCase with use prefix (`useRecords.ts`)
-- 유틸/상수/API: camelCase (`formatDate.ts`, `getRecords.ts`)
-- 타입 파일: camelCase (`recordDto.ts`)
+- 컴포넌트: PascalCase (`RecordCard.tsx`)
+- Server Actions: camelCase with Action postfix (`processRecordAction.ts`, `confirmRecordAction.ts`)
+- 유틸/상수: camelCase (`formatDate.ts`, `cn.ts`)
+- 타입 파일: camelCase (`record.ts`)
 
 ### 함수 선언 스타일
 
@@ -633,40 +497,30 @@ export const formatPeriod = (startAt: Date, endAt: Date | null) => {
 ```
 
 ```typescript
-// features/record/apis/getRecords.ts
-import type { WorkRecord } from '@prisma/client';
+// features/record/actions/deleteRecordAction.ts
+'use server';
 
-export const getRecords = async (): Promise<WorkRecord[]> => {
-  const response = await fetch('/api/records');
-  const data = await response.json();
-  return data.records;
-};
-```
+import { revalidatePath } from 'next/cache';
+import { prisma } from '@/lib/prisma';
 
-```typescript
-// features/record/hooks/queries/useRecords.ts
-import { useQuery } from '@tanstack/react-query';
-import { getRecords } from '../../apis';
-
-export const useRecords = () => {
-  return useQuery({
-    queryKey: ['records'],
-    queryFn: getRecords,
-  });
+export const deleteRecordAction = async (id: string) => {
+  await prisma.workRecord.delete({ where: { id } });
+  revalidatePath('/records');
 };
 ```
 
 ### Prisma
 
 - 클라이언트는 `lib/prisma.ts`에서 싱글톤으로 export
-- DB 쿼리는 Route Handler에서만 실행 (서버 사이드)
+- DB 쿼리는 RSC 및 Server Actions에서 실행 (서버 사이드)
 - 복잡한 쿼리는 `features/[domain]/services/`에 함수로 분리
 
-### LLM
+### Vercel AI SDK
 
+- 모델 인스턴스는 `lib/ai.ts`에서 관리
 - 프롬프트 템플릿은 `features/[domain]/prompts/`에 관리
-- 응답 스키마는 Zod로 정의하여 타입 안전성 확보
-- API 호출 추상화는 `lib/llm.ts`에서 관리 (모델 교체 용이하게)
+- 응답 스키마는 Zod로 정의하여 `generateObject`로 타입 안전한 응답 파싱
+- Chat 스트리밍은 Route Handler + `useChat` 조합 사용 (ai/react)
 
 ## 환경 변수
 
@@ -682,32 +536,20 @@ OPENAI_API_KEY="sk-..."
 ## 개발 명령어
 
 ```bash
-# 개발 서버
-npm run dev
+npm run dev              # 개발 서버
+npm run build            # 빌드
+npm run lint             # 린트
 
-# 빌드
-npm run build
-
-# 린트
-npm run lint
-
-# Prisma 명령어
-npx prisma generate      # schema.prisma → Prisma Client 타입 생성
-npx prisma db push       # schema.prisma → DB 스키마 동기화 (개발용, 마이그레이션 없이)
-npx prisma migrate dev   # 마이그레이션 생성 + 적용 (운영 전 사용)
-npx prisma migrate deploy # 마이그레이션 적용 (운영 배포 시)
-npx prisma studio        # DB GUI (localhost:5555)
+npx prisma generate      # 스키마 변경 후 타입 생성
+npx prisma db push       # 개발 중 DB 동기화
+npx prisma studio        # DB GUI
 ```
-
-### Prisma 워크플로우
-
-1. `prisma/schema.prisma` 수정
-2. `npx prisma generate` 실행 (타입 갱신)
-3. 개발 중: `npx prisma db push`로 빠르게 동기화
-4. 배포 전: `npx prisma migrate dev`로 마이그레이션 생성
-5. 배포 시: `npx prisma migrate deploy`로 마이그레이션 적용
 
 ## 인증
 
 - 없음 (private 서비스, 본인만 사용)
 - Cloudflare Tunnel + Access로 접근 제어 가능
+
+## 참고 자료
+
+- [Vercel AI SDK - RAG Chatbot Guide](https://ai-sdk.dev/cookbook/guides/rag-chatbot)
